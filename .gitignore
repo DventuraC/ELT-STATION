@@ -1,0 +1,6 @@
+bin/
+obj/
+appsettings.Development.json
+appsettings.Production.json
+scripts/gasolution-connections.txt
+scripts/gasolution-paita.txt

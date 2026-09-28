@@ -1,0 +1,4 @@
+# Formato: Estacion|Servidor[\Instancia]|BaseDeDatos|Usuario|Contrasena
+# No agregues este archivo con credenciales reales al repositorio.
+EDS ARGENTINA|10.0.25.30|Hadi|energigas|CAMBIAR_CONTRASENA
+EDS CALLAO|10.0.90.111\SQLEXPRESS|Hadi|energigas|CAMBIAR_CONTRASENA
