@@ -4,6 +4,7 @@ using System.Text;
 using System.Data;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata;
 using StationSales.Application;
@@ -54,7 +55,12 @@ public sealed class EfExtractionRepository : IExtractionRepository
 }
 public sealed class EfRawSaleWriter : IRawSaleWriter
 {
-    private readonly StationSalesDbContext _db; private readonly IClock _clock; public EfRawSaleWriter(StationSalesDbContext db, IClock clock) => (_db, _clock) = (db, clock);
+    private const int MaxDeadlockAttempts = 3;
+    private const int ApplicationLockTimeoutMilliseconds = 120_000;
+    private readonly StationSalesDbContext _db;
+    private readonly IClock _clock;
+    private readonly ILogger<EfRawSaleWriter> _logger;
+    public EfRawSaleWriter(StationSalesDbContext db, IClock clock, ILogger<EfRawSaleWriter> logger) => (_db, _clock, _logger) = (db, clock, logger);
     public async Task<int> WriteAsync(ExtractionRun run, DataSource source, IReadOnlyCollection<ExtractedSaleRow> rows, CancellationToken token)
     {
         if (source.Provider == SourceProvider.OpenComb) return await UpsertOpenCombAsync(run, source, rows, token);
@@ -116,33 +122,87 @@ public sealed class EfRawSaleWriter : IRawSaleWriter
             for (var i = 0; i < properties.Length; i++) record[i] = properties[i].PropertyInfo!.GetValue(item) ?? DBNull.Value;
             data.Rows.Add(record);
         }
+        for (var attempt = 1; attempt <= MaxDeadlockAttempts; attempt++)
+        {
+            try
+            {
+                await BulkUpsertAttemptAsync(data, properties, columns, table, targetTable, stagingTable, token);
+                return;
+            }
+            catch (SqlException ex) when (ex.Number == 1205 && attempt < MaxDeadlockAttempts)
+            {
+                var delay = TimeSpan.FromMilliseconds((200 * (1 << (attempt - 1))) + Random.Shared.Next(50, 201));
+                _logger.LogWarning(ex, "Deadlock writing raw table {TargetTable}. Retrying attempt {NextAttempt}/{MaxAttempts} in {DelayMilliseconds} ms.", targetTable, attempt + 1, MaxDeadlockAttempts, delay.TotalMilliseconds);
+                await Task.Delay(delay, token);
+            }
+        }
+    }
+
+    private async Task BulkUpsertAttemptAsync(DataTable data, IReadOnlyCollection<IProperty> properties, IReadOnlyCollection<string> columns, StoreObjectIdentifier table, string targetTable, string stagingTable, CancellationToken token)
+    {
         var connection = (SqlConnection)_db.Database.GetDbConnection();
         await connection.OpenAsync(token);
         await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(token);
         try
         {
-            var clear = connection.CreateCommand(); clear.Transaction = transaction; clear.CommandText = $"DELETE FROM [raw].[{stagingTable}] WHERE [ExtractionRunId] = @runId"; clear.Parameters.Add(new SqlParameter("@runId", data.Rows[0]["ExtractionRunId"])); await clear.ExecuteNonQueryAsync(token);
+            await AcquireApplicationLockAsync(connection, transaction, targetTable, token);
+
+            await using var clear = connection.CreateCommand();
+            clear.Transaction = transaction;
+            clear.CommandText = $"DELETE FROM [raw].[{stagingTable}] WHERE [ExtractionRunId] = @runId";
+            clear.Parameters.Add(new SqlParameter("@runId", data.Rows[0]["ExtractionRunId"]));
+            await clear.ExecuteNonQueryAsync(token);
+
             using (var bulk = new SqlBulkCopy(connection, SqlBulkCopyOptions.TableLock, transaction) { DestinationTableName = $"[raw].[{stagingTable}]", BatchSize = 2_000 })
             {
                 foreach (var property in properties) bulk.ColumnMappings.Add(property.Name, property.GetColumnName(table) ?? property.Name);
                 await bulk.WriteToServerAsync(data, token);
             }
+
             var key = "t.[DataSourceId] = s.[DataSourceId] AND t.[SourceRecordId] = s.[SourceRecordId]";
             var assignments = string.Join(", ", columns.Where(x => x is not "DataSourceId" and not "SourceRecordId").Select(x => $"t.[{x}] = s.[{x}]"));
             var listed = string.Join(", ", columns.Select(x => $"[{x}]"));
             var selected = string.Join(", ", columns.Select(x => $"s.[{x}]"));
-            var merge = connection.CreateCommand(); merge.Transaction = transaction; merge.CommandText = $@"
+            await using var merge = connection.CreateCommand();
+            merge.Transaction = transaction;
+            merge.CommandText = $@"
 UPDATE t SET {assignments}
 FROM [raw].[{targetTable}] t INNER JOIN [raw].[{stagingTable}] s ON {key}
 WHERE s.[ExtractionRunId] = @runId AND (t.[RowHash] IS NULL OR t.[RowHash] <> s.[RowHash]);
 INSERT INTO [raw].[{targetTable}] ({listed})
 SELECT {selected} FROM [raw].[{stagingTable}] s
 WHERE s.[ExtractionRunId] = @runId AND NOT EXISTS (SELECT 1 FROM [raw].[{targetTable}] t WHERE {key});
-DELETE FROM [raw].[{stagingTable}] WHERE [ExtractionRunId] = @runId;"; merge.Parameters.Add(new SqlParameter("@runId", data.Rows[0]["ExtractionRunId"])); await merge.ExecuteNonQueryAsync(token);
+DELETE FROM [raw].[{stagingTable}] WHERE [ExtractionRunId] = @runId;";
+            merge.Parameters.Add(new SqlParameter("@runId", data.Rows[0]["ExtractionRunId"]));
+            await merge.ExecuteNonQueryAsync(token);
             await transaction.CommitAsync(token);
         }
-        catch { await transaction.RollbackAsync(token); throw; }
+        catch
+        {
+            try { await transaction.RollbackAsync(CancellationToken.None); }
+            catch (Exception rollbackException) { _logger.LogWarning(rollbackException, "Rollback failed after raw write error for table {TargetTable}.", targetTable); }
+            throw;
+        }
         finally { await connection.CloseAsync(); }
+    }
+
+    private static async Task AcquireApplicationLockAsync(SqlConnection connection, SqlTransaction transaction, string targetTable, CancellationToken token)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandTimeout = (ApplicationLockTimeoutMilliseconds / 1_000) + 30;
+        command.CommandText = @"
+DECLARE @result int;
+EXEC @result = sys.sp_getapplock
+    @Resource = @resource,
+    @LockMode = 'Exclusive',
+    @LockOwner = 'Transaction',
+    @LockTimeout = @lockTimeout;
+SELECT @result;";
+        command.Parameters.Add(new SqlParameter("@resource", SqlDbType.NVarChar, 255) { Value = $"StationSales:raw:{targetTable}" });
+        command.Parameters.Add(new SqlParameter("@lockTimeout", SqlDbType.Int) { Value = ApplicationLockTimeoutMilliseconds });
+        var result = Convert.ToInt32(await command.ExecuteScalarAsync(token), CultureInfo.InvariantCulture);
+        if (result < 0) throw new InvalidOperationException($"Could not acquire the central RAW write lock for table '{targetTable}'. sp_getapplock returned {result}.");
     }
 }
 public sealed class EfCoreRepository : ICoreRepository

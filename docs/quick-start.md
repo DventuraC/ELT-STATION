@@ -40,6 +40,8 @@ $env:DOTNET_ENVIRONMENT = 'Production'
 | Extracción por estación | `dotnet run --project src/StationSales.Worker -- extract --source GASOLUTION_EDS_ARGENTINA` | Ejecuta solo una fuente activa por su código. |
 | Solo OpenComb | `dotnet run --project src/StationSales.Worker -- extract-opencomb` | Ejecuta fuentes OpenComb que estén vencidas según su intervalo. |
 | Solo Gasolution | `dotnet run --project src/StationSales.Worker -- extract-gasolution` | Ejecuta fuentes Gasolution que estén vencidas según su intervalo. |
+| Recuperación OpenComb | `dotnet run --project src/StationSales.Worker -- backfill-opencomb --from 2026-09-01 --to 2026-09-27` | Reprocesa el rango local de Lima para todas las fuentes OpenComb activas, sin avanzar watermarks. |
+| Recuperación OpenComb por estación | `dotnet run --project src/StationSales.Worker -- backfill-opencomb --source OPENCOMB_EDS_CALLAO --from 2026-09-01 --to 2026-09-27` | Reprocesa una fuente OpenComb activa, sin avanzar su watermark. |
 | Recuperación Gasolution | `dotnet run --project src/StationSales.Worker -- backfill-gasolution --from 2026-09-01 --to 2026-09-27` | Reprocesa el rango local de Lima en paralelo de cuatro, sin avanzar watermarks. |
 | Transformación | `dotnet run --project src/StationSales.Worker -- transform` | Reserva el punto de entrada de normalización Core; los contratos Core deben aprobarse antes de implementarla. |
 | Publicación | `dotnet run --project src/StationSales.Worker -- publish --destination sqlserver` | Punto de entrada de publicación MART. |
@@ -62,6 +64,8 @@ La auditoría está en el esquema `etl` de la base central:
 - `raw.opencomb_station_sale` y `raw.gasolution_station_sale`: datos replicados de origen.
 
 Una fuente sin datos termina como `SucceededWithNoData`; no avanza su watermark. Las fuentes con error técnico terminan como `Failed` y no bloquean las demás estaciones.
+
+`StartDate` es el límite inferior de la extracción. La ventana de recuperación nunca consulta fechas anteriores a ese valor; si una ejecución falla antes de establecer un watermark, el siguiente intento vuelve a comenzar en `StartDate`.
 
 ## RAW y carga masiva
 

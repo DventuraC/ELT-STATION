@@ -9,13 +9,41 @@ public sealed class IncrementalWindowCalculator
     {
         if (configuration.RecoveryDays < 0) throw new ArgumentOutOfRangeException(nameof(configuration.RecoveryDays));
         var checkpoint = configuration.LastSuccessfulDate ?? configuration.StartDate;
-        return new ExtractionWindow(checkpoint.AddDays(-configuration.RecoveryDays), nowUtc);
+        var recoveredFrom = checkpoint.AddDays(-configuration.RecoveryDays);
+        var fromUtc = recoveredFrom < configuration.StartDate ? configuration.StartDate : recoveredFrom;
+        return new ExtractionWindow(fromUtc, nowUtc);
+    }
+}
+public sealed class RawWriteCoordinator : IRawWriteCoordinator, IDisposable
+{
+    private readonly SemaphoreSlim _openComb = new(1, 1);
+    private readonly SemaphoreSlim _gasolution = new(1, 1);
+
+    public async Task<T> ExecuteAsync<T>(SourceProvider provider, Func<CancellationToken, Task<T>> operation, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(operation);
+        var gate = provider switch
+        {
+            SourceProvider.OpenComb => _openComb,
+            SourceProvider.Gasolution => _gasolution,
+            _ => throw new ArgumentOutOfRangeException(nameof(provider), provider, "Unsupported source provider.")
+        };
+
+        await gate.WaitAsync(cancellationToken);
+        try { return await operation(cancellationToken); }
+        finally { gate.Release(); }
+    }
+
+    public void Dispose()
+    {
+        _openComb.Dispose();
+        _gasolution.Dispose();
     }
 }
 public sealed class ExtractStationSalesUseCase
 {
-    private readonly IExtractionRepository _repository; private readonly IExtractorResolver _extractors; private readonly IRawSaleWriter _writer; private readonly IClock _clock; private readonly IncrementalWindowCalculator _windows;
-    public ExtractStationSalesUseCase(IExtractionRepository repository, IExtractorResolver extractors, IRawSaleWriter writer, IClock clock, IncrementalWindowCalculator windows) => (_repository, _extractors, _writer, _clock, _windows) = (repository, extractors, writer, clock, windows);
+    private readonly IExtractionRepository _repository; private readonly IExtractorResolver _extractors; private readonly IRawSaleWriter _writer; private readonly IRawWriteCoordinator _writeCoordinator; private readonly IClock _clock; private readonly IncrementalWindowCalculator _windows;
+    public ExtractStationSalesUseCase(IExtractionRepository repository, IExtractorResolver extractors, IRawSaleWriter writer, IRawWriteCoordinator writeCoordinator, IClock clock, IncrementalWindowCalculator windows) => (_repository, _extractors, _writer, _writeCoordinator, _clock, _windows) = (repository, extractors, writer, writeCoordinator, clock, windows);
     public async Task<int> ExecuteAsync(string? sourceCode, CancellationToken cancellationToken)
     {
         var failures = 0;
@@ -26,7 +54,7 @@ public sealed class ExtractStationSalesUseCase
             {
                 var rows = await _extractors.Resolve(config.DataSource.Provider).ExtractAsync(config.DataSource, window, cancellationToken);
                 if (rows.Count == 0) { await _repository.SucceedWithNoDataAsync(run, cancellationToken); continue; }
-                var written = await _writer.WriteAsync(run, config.DataSource, rows, cancellationToken);
+                var written = await _writeCoordinator.ExecuteAsync(config.DataSource.Provider, token => _writer.WriteAsync(run, config.DataSource, rows, token), cancellationToken);
                 await _repository.SucceedAsync(run, config, rows.Count, written, now, cancellationToken);
             }
             catch (Exception ex) { failures++; await _repository.FailAsync(run, ex, cancellationToken); }
@@ -43,7 +71,7 @@ public sealed class ExtractStationSalesUseCase
             {
                 var rows = await _extractors.Resolve(config.DataSource.Provider).ExtractAsync(config.DataSource, window, cancellationToken);
                 if (rows.Count == 0) { await _repository.SucceedWithNoDataAsync(run, cancellationToken); continue; }
-                var written = await _writer.WriteAsync(run, config.DataSource, rows, cancellationToken);
+                var written = await _writeCoordinator.ExecuteAsync(config.DataSource.Provider, token => _writer.WriteAsync(run, config.DataSource, rows, token), cancellationToken);
                 await _repository.SucceedWithoutCheckpointAsync(run, rows.Count, written, cancellationToken);
             }
             catch (Exception ex) { failures++; await _repository.FailAsync(run, ex, cancellationToken); }

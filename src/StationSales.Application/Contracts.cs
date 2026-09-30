@@ -18,6 +18,10 @@ public interface IStationSaleExtractor
 }
 public interface IExtractorResolver { IStationSaleExtractor Resolve(SourceProvider provider); }
 public interface IRawSaleWriter { Task<int> WriteAsync(ExtractionRun run, DataSource source, IReadOnlyCollection<ExtractedSaleRow> rows, CancellationToken cancellationToken); }
+public interface IRawWriteCoordinator
+{
+    Task<T> ExecuteAsync<T>(SourceProvider provider, Func<CancellationToken, Task<T>> operation, CancellationToken cancellationToken);
+}
 public interface IExtractionRepository
 {
     Task<IReadOnlyCollection<PipelineDataSource>> GetActiveAsync(string? sourceCode, CancellationToken cancellationToken);
